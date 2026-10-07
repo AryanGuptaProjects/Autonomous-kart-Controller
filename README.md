@@ -19,8 +19,7 @@ High-precision SPI driver and testing firmware for the **MagnTek MT6835** 21-bit
 - [6. Build, Flashing & Execution](#6-build-flashing--execution)
 - [7. Expected Serial Output](#7-expected-serial-output)
 - [8. Autonomous Go-Kart Integration Context](#8-autonomous-go-kart-integration-context)
-- [9. Repository Branch Structure](#9-repository-branch-structure)
-- [10. Troubleshooting & FAQ](#10-troubleshooting--faq)
+- [9. Troubleshooting & FAQ](#9-troubleshooting--faq)
 
 ---
 
@@ -258,29 +257,7 @@ This evaluation module serves as the next-generation sensor upgrade for the **Ma
 
 ---
 
-## 9. Repository Branch Structure
-
-This repository contains multiple development branches tailored to different layers of the vehicle control stack:
-
-| Branch | Purpose / Contents |
-| :--- | :--- |
-| **`MT6835`** *(Current)* | Standalone testing and evaluation suite for the 21-bit MT6835 magnetic encoder. |
-| **`test`** / **`main`** | Complete drive-by-wire system: ESP32 PID steering (`steering.cpp`), DAC throttle (`throttle.cpp`), linear actuator brake (`brake.cpp`), and ROS 2 package (`motor_controller`). |
-| **`aryan`** / **`team-main`**| Team upstream synchronization and experimental features. |
-
-To switch back to the complete vehicle firmware stack:
-```bash
-git switch test
-```
-
-To switch back to this MT6835 encoder driver branch:
-```bash
-git switch MT6835
-```
-
----
-
-## 10. Troubleshooting & FAQ
+## 9. Troubleshooting & FAQ
 
 ### Problem 1: `Raw Count: 0` or `Raw Count: 2097151` constant output
 - **Cause**: SPI bus communication failure or Chip Select wiring mismatch.
