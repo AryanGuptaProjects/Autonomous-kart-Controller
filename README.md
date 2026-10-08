@@ -1,5 +1,7 @@
 # MT6835 21-Bit Magnetic Rotary Encoder — Evaluation & SPI Driver
 
+UPDATED : 8 OCTOBER 2026
+
 [![Language: C++ / Arduino](https://img.shields.io/badge/Language-C%2B%2B%20%2F%20Arduino-00599C?logo=c%2B%2B)](https://www.arduino.cc/)
 [![Platform: ESP32 / Arduino MCU](https://img.shields.io/badge/Platform-ESP32%20%2F%20Microcontroller-E7352C?logo=espressif)](https://www.espressif.com/)
 [![Sensor: MagnTek MT6835](https://img.shields.io/badge/Sensor-MagnTek%20MT6835-green)](https://www.magntek.com.cn/)
