@@ -1,8 +1,8 @@
 #include <SPI.h>
 
 // --- ESP32 Custom SPI Pins ---
-const int CS_PIN   = 32;
-const int SCK_PIN  = 22;
+const int CS_PIN   = 4;
+const int SCK_PIN  = 14;
 const int MISO_PIN = 35;  // (or 33)
 const int MOSI_PIN = 23;
 
@@ -41,23 +41,33 @@ void setup() {
 }
 
 
-uint32_t readRawAngle() {
+// Returns raw angle and sets 'magnetPresent' to false if the magnet is missing
+uint32_t readRawAngle(bool &magnetPresent) {
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
   
   digitalWrite(CS_PIN, LOW);
   
-  // Command to read register 0x003
+  // Command to read starting at register 0x003
   SPI.transfer(0xA0); 
   SPI.transfer(0x03);
   
   uint8_t b0 = SPI.transfer(0x00); // ANGLE[20:13]
   uint8_t b1 = SPI.transfer(0x00); // ANGLE[12:5]
-  uint8_t b2 = SPI.transfer(0x00); // ANGLE[4:0] (top 5 bits) + status
+  uint8_t b2 = SPI.transfer(0x00); // ANGLE[4:0] (bits 7..3) + STATUS (bits 2..0)
   
   digitalWrite(CS_PIN, HIGH);
   SPI.endTransaction();
 
-  // Extract 21-bit position value (0 to 2097151)
+  // Extract status bits (bits 2..0 of b2)
+  uint8_t status = b2 & 0x07;
+  
+  // Bit 1 (0x02) triggers high when the magnetic field is too weak or missing
+  bool lowMagField = (status & 0x02) != 0;
+  
+  // Magnet is present if low magnetic field warning is NOT active
+  magnetPresent = !lowMagField; 
+
+  // Extract 21-bit angle position
   return ((uint32_t)b0 << 13) | ((uint32_t)b1 << 5) | (b2 >> 3);
 }
 
@@ -78,34 +88,45 @@ int32_t getSteeringCounts(uint32_t raw) {
 }
 
 void loop() {
-  uint32_t raw = readRawAngle();
+  bool isMagnetValid = true;
+  uint32_t raw = readRawAngle(isMagnetValid);
 
-  // 1. Calculate steering offset from dead center in raw ticks (dead center = 0)
-  int32_t steeringCounts = getSteeringCounts(raw);
+  int32_t steeringCounts = 0;
+  int32_t clampedCounts  = 0;
+  float displayAngleDeg  = 0.0f;
 
-  // 2. Enforce limits strictly in raw counts (integer arithmetic)
-  int32_t clampedCounts = constrain(steeringCounts, MIN_STEERING_COUNTS, MAX_STEERING_COUNTS);
-  bool isAtLimit = (steeringCounts > MAX_STEERING_COUNTS) || (steeringCounts < MIN_STEERING_COUNTS);
+  if (!isMagnetValid) {
+    // Force output to 0 if magnet is missing or out of range
+    steeringCounts  = 0;
+    clampedCounts   = 0;
+    displayAngleDeg = 0.0f;
 
-  // --- VISUAL PRESENTATION ONLY (convert to degrees for human monitoring) ---
-  float displayAngleDeg = (clampedCounts * 360.0f) / (float)TOTAL_COUNTS;
-  float sensorDegrees   = (raw * 360.0f) / (float)TOTAL_COUNTS;
+    Serial.println("[ERROR] Magnet Not Detected / Removed! Output forced to 0.");
+  } else {
+    // Normal operation when magnet is detected
+    steeringCounts = getSteeringCounts(raw);
+    clampedCounts  = constrain(steeringCounts, MIN_STEERING_COUNTS, MAX_STEERING_COUNTS);
+    
+    bool isAtLimit      = (steeringCounts > MAX_STEERING_COUNTS) || (steeringCounts < MIN_STEERING_COUNTS);
+    displayAngleDeg     = (clampedCounts * 360.0f) / (float)TOTAL_COUNTS;
+    float sensorDegrees = (raw * 360.0f) / (float)TOTAL_COUNTS;
 
-  Serial.print("Raw: ");
-  Serial.print(raw);
-  Serial.print(" | Sensor: ");
-  Serial.print(sensorDegrees, 4);
-  Serial.print(" deg | Clamped Counts: ");
-  Serial.print(clampedCounts);
-  Serial.print(" | Angle: ");
-  Serial.print(displayAngleDeg, 4);
-  Serial.print(" deg");
+    Serial.print("Raw: ");
+    Serial.print(raw);
+    Serial.print(" | Sensor: ");
+    Serial.print(sensorDegrees, 4);
+    Serial.print(" deg | Clamped Counts: ");
+    Serial.print(clampedCounts);
+    Serial.print(" | Angle: ");
+    Serial.print(displayAngleDeg, 4);
+    Serial.print(" deg");
 
-  if (isAtLimit) {
-    Serial.print(" [LIMIT REACHED]");
+    if (isAtLimit) {
+      Serial.print(" [LIMIT REACHED]");
+    }
+
+    Serial.println();
   }
-
-  Serial.println();
 
   delay(100);
 }
