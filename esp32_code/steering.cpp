@@ -1,315 +1,152 @@
 #include "steering.h"
-#include "driver/pulse_cnt.h"
 
 // ============================================================
 // Direction Conventions
 // ============================================================
 
+// Calibrated straight-ahead dead center count
+static uint32_t deadCenterCount = DEFAULT_DEAD_CENTER;
+
+// Direction convention: 1 = Normal, -1 = Inverted
+constexpr int ANGLE_ROTATION_DIRECTION = 1;
+
 // Maps physical pin states to logical left/right steering directions
 constexpr int DIR_THAT_DECREASES_COUNT = HIGH;
-constexpr int DIR_LEFT  = DIR_THAT_DECREASES_COUNT;
+constexpr int DIR_LEFT = DIR_THAT_DECREASES_COUNT;
 constexpr int DIR_RIGHT = !DIR_THAT_DECREASES_COUNT;
-
 
 // ============================================================
 // PWM Settings
 // ============================================================
 
-constexpr int pwmFreq       = 5000;   // 5 kHz PWM frequency
-constexpr int pwmResolution = 8;      // 8-bit resolution (0-255)
-
+constexpr int pwmFreq = 5000;    // 5 kHz PWM frequency
+constexpr int pwmResolution = 8; // 8-bit resolution (0-255)
 
 // ============================================================
 // Limits & Deadband
 // ============================================================
-
-int minPWM   = 25;    // Minimum PWM to overcome static friction
-int maxPWM   = 150;   // Maximum allowed PWM
-int deadband = 10;     // Acceptable encoder error
-
+int minPWM = 25;  // Minimum PWM to overcome mechanical static friction
+int maxPWM = 150; // Maximum safe PWM cap
+int deadband =
+    150; // Acceptable count error (~150 counts is only 0.025 degrees!)
 
 // ============================================================
-// PID Tuning Parameters
+// PID Tuning Parameters (Scaled down for 21-bit MT6835)
 // ============================================================
-
-float Kp = 0.20f;
-float Ki = 0.001f;
-float Kd = 0.02f;
-
+float Kp = 0.012f;   // Down from 0.20 (scaled down ~16x for 21-bit counts)
+float Ki = 0.00005f; // Down from 0.001
+float Kd = 0.0015f;  // Down from 0.02
 
 // ============================================================
 // Integral Limits
 // ============================================================
-
-float maxIntegral = 1000.0f;
-
+float maxIntegral = 10000.0f; // Adjusted for larger count error accumulation
 
 // ============================================================
 // State Variables
 // ============================================================
 
 volatile long targetPosition = 0;
-bool pidEnabled              = false;
-bool manualUnrestricted      = false;
-
+bool pidEnabled = false;
+bool manualUnrestricted = false;
 
 // ============================================================
 // Internal PID States
 // ============================================================
 
-static float lastError     = 0.0f;
+static float lastError = 0.0f;
 static float integralError = 0.0f;
 static unsigned long lastTime = 0;
-
 
 // ============================================================
 // Encoder Health Monitoring
 // ============================================================
 
-static bool encoderFault            = false;
-static long lastEncoderCount        = 0;
+static bool encoderFault = false;
+static long lastEncoderCount = 0;
 static unsigned long lastMotionTime = 0;
 
 // If motor is commanded but encoder doesn't move for this duration,
 // trigger a safety fault.
 constexpr unsigned long ENCODER_TIMEOUT_MS = 100;
 
-
-// ============================================================
-// NEW PCNT DRIVER
-// ============================================================
-
-// PCNT unit handle
-static pcnt_unit_handle_t steeringPCNT = nullptr;
-
-// Two PCNT channels for quadrature decoding
-static pcnt_channel_handle_t channelA = nullptr;
-static pcnt_channel_handle_t channelB = nullptr;
-
-
 // ============================================================
 // SETUP STEERING
 // ============================================================
 
 void setupSteering() {
+  pinMode(PIN_DIR, OUTPUT);
+  ledcAttach(PIN_PWM, pwmFreq, pwmResolution);
 
-    // Motor direction
-    pinMode(PIN_DIR, OUTPUT);
+  // Initialize Chip Select
+  pinMode(PIN_ENC_CS, OUTPUT);
+  digitalWrite(PIN_ENC_CS, HIGH);
 
-    // Motor PWM
-    ledcAttach(PIN_PWM, pwmFreq, pwmResolution);
-
-    // Encoder inputs
-    pinMode(PIN_ENC_A, INPUT_PULLUP);
-    pinMode(PIN_ENC_B, INPUT_PULLUP);
-
-    // Initialize hardware quadrature encoder
-    setupPCNT();
+  // Start SPI bus with custom pin mapping
+  // SPI.begin(SCK, MISO, MOSI, CS)
+  SPI.begin(PIN_ENC_SCK, PIN_ENC_MISO, PIN_ENC_MOSI, PIN_ENC_CS);
 }
-
 
 // ============================================================
 // SETUP NEW PCNT DRIVER
 // ============================================================
-
-void setupPCNT() {
-
-    // --------------------------------------------------------
-    // Create PCNT unit
-    // --------------------------------------------------------
-
-    pcnt_unit_config_t unit_config = {
-        .low_limit = -32768,
-        .high_limit = 32767
-    };
-
-    ESP_ERROR_CHECK(
-        pcnt_new_unit(
-            &unit_config,
-            &steeringPCNT
-        )
-    );
-
-
-    // --------------------------------------------------------
-    // Configure glitch filter
-    // --------------------------------------------------------
-
-    pcnt_glitch_filter_config_t filter_config = {
-        .max_glitch_ns = 1000
-    };
-
-    ESP_ERROR_CHECK(
-        pcnt_unit_set_glitch_filter(
-            steeringPCNT,
-            &filter_config
-        )
-    );
-
-
-    // --------------------------------------------------------
-    // CHANNEL A
-    //
-    // Edge signal  = Encoder A
-    // Level signal = Encoder B
-    // --------------------------------------------------------
-
-    pcnt_chan_config_t channel_a_config = {
-        .edge_gpio_num = PIN_ENC_A,
-        .level_gpio_num = PIN_ENC_B
-    };
-
-    ESP_ERROR_CHECK(
-        pcnt_new_channel(
-            steeringPCNT,
-            &channel_a_config,
-            &channelA
-        )
-    );
-
-
-    // Rising A  -> increase
-    // Falling A -> decrease
-    ESP_ERROR_CHECK(
-        pcnt_channel_set_edge_action(
-            channelA,
-            PCNT_CHANNEL_EDGE_ACTION_DECREASE,
-            PCNT_CHANNEL_EDGE_ACTION_INCREASE
-        )
-    );
-
-
-    // B HIGH -> keep
-    // B LOW  -> inverse
-    ESP_ERROR_CHECK(
-        pcnt_channel_set_level_action(
-            channelA,
-            PCNT_CHANNEL_LEVEL_ACTION_KEEP,
-            PCNT_CHANNEL_LEVEL_ACTION_INVERSE
-        )
-    );
-
-
-    // --------------------------------------------------------
-    // CHANNEL B
-    //
-    // Edge signal  = Encoder B
-    // Level signal = Encoder A
-    // --------------------------------------------------------
-
-    pcnt_chan_config_t channel_b_config = {
-        .edge_gpio_num = PIN_ENC_B,
-        .level_gpio_num = PIN_ENC_A
-    };
-
-    ESP_ERROR_CHECK(
-        pcnt_new_channel(
-            steeringPCNT,
-            &channel_b_config,
-            &channelB
-        )
-    );
-
-
-    // Rising B  -> increase
-    // Falling B -> decrease
-    ESP_ERROR_CHECK(
-        pcnt_channel_set_edge_action(
-            channelB,
-            PCNT_CHANNEL_EDGE_ACTION_DECREASE,
-            PCNT_CHANNEL_EDGE_ACTION_INCREASE
-        )
-    );
-
-
-    // A HIGH -> inverse
-    // A LOW  -> keep
-    ESP_ERROR_CHECK(
-        pcnt_channel_set_level_action(
-            channelB,
-            PCNT_CHANNEL_LEVEL_ACTION_INVERSE,
-            PCNT_CHANNEL_LEVEL_ACTION_KEEP
-        )
-    );
-
-
-    // --------------------------------------------------------
-    // Enable PCNT unit
-    // --------------------------------------------------------
-
-    ESP_ERROR_CHECK(
-        pcnt_unit_enable(
-            steeringPCNT
-        )
-    );
-
-
-    // --------------------------------------------------------
-    // Clear initial count
-    // --------------------------------------------------------
-
-    ESP_ERROR_CHECK(
-        pcnt_unit_clear_count(
-            steeringPCNT
-        )
-    );
-
-
-    // --------------------------------------------------------
-    // Start counting
-    // --------------------------------------------------------
-
-    ESP_ERROR_CHECK(
-        pcnt_unit_start(
-            steeringPCNT
-        )
-    );
-}
-
 
 // ============================================================
 // GET ENCODER COUNT
 // ============================================================
 
 long getEncoderCount() {
+  uint32_t raw = readRawEncoderAngle();
+  int32_t diff = (int32_t)raw - (int32_t)deadCenterCount;
 
-    int count = 0;
+  // Handle circular wrap across 180-degree boundary
+  if (diff > HALF_ENC_COUNTS) {
+    diff -= TOTAL_ENC_COUNTS;
+  } else if (diff < -HALF_ENC_COUNTS) {
+    diff += TOTAL_ENC_COUNTS;
+  }
 
-    ESP_ERROR_CHECK(
-        pcnt_unit_get_count(
-            steeringPCNT,
-            &count
-        )
-    );
-
-    return (long)count;
+  return (long)(diff * ANGLE_ROTATION_DIRECTION);
 }
 
+// ============================================================
+// MT6835 SPI Read Protocol
+// ============================================================
+
+uint32_t readRawEncoderAngle() {
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+  digitalWrite(PIN_ENC_CS, LOW);
+
+  // Command to read angle register 0x003
+  SPI.transfer(0xA0);
+  SPI.transfer(0x03);
+
+  uint8_t b0 = SPI.transfer(0x00); // Angle bits [20:13]
+  uint8_t b1 = SPI.transfer(0x00); // Angle bits [12:5]
+  uint8_t b2 = SPI.transfer(0x00); // Angle bits [4:0] (top 5 bits) + status
+
+  digitalWrite(PIN_ENC_CS, HIGH);
+  SPI.endTransaction();
+
+  return ((uint32_t)b0 << 13) | ((uint32_t)b1 << 5) | (b2 >> 3);
+}
 
 // ============================================================
 // ZERO ENCODER
 // ============================================================
 
 void zeroEncoderCount() {
-
-    ESP_ERROR_CHECK(
-        pcnt_unit_clear_count(
-            steeringPCNT
-        )
-    );
-
-    clearEncoderFault();
+  // Save the current physical position as the straight-ahead reference
+  deadCenterCount = readRawEncoderAngle();
+  clearEncoderFault();
+  Serial.printf("[ENCODER] Calibrated new Dead Center: %u\n", deadCenterCount);
 }
-
 
 // ============================================================
 // ENCODER FAULT STATUS
 // ============================================================
 
-bool isEncoderFault() {
-    return encoderFault;
-}
-
+bool isEncoderFault() { return encoderFault; }
 
 // ============================================================
 // CLEAR ENCODER FAULT
@@ -317,13 +154,12 @@ bool isEncoderFault() {
 
 void clearEncoderFault() {
 
-    encoderFault = false;
+  encoderFault = false;
 
-    lastMotionTime = millis();
+  lastMotionTime = millis();
 
-    lastEncoderCount = getEncoderCount();
+  lastEncoderCount = getEncoderCount();
 }
-
 
 // ============================================================
 // ENABLE PID
@@ -331,46 +167,35 @@ void clearEncoderFault() {
 
 void enablePID(long newTarget) {
 
-    // Do not engage PID if encoder has a fault
-    if (encoderFault) {
-        return;
-    }
+  // Do not engage PID if encoder has a fault
+  if (encoderFault) {
+    return;
+  }
 
-    manualUnrestricted = false;
+  manualUnrestricted = false;
 
-    // Clamp target to safe mechanical boundaries
-    long clampedTarget =
-        constrain(
-            newTarget,
-            MIN_POS_LIMIT,
-            MAX_POS_LIMIT
-        );
+  // Clamp target to safe mechanical boundaries
+  long clampedTarget = constrain(newTarget, MIN_POS_LIMIT, MAX_POS_LIMIT);
 
+  // Reinitialize PID if target changed
+  // or PID was previously disabled
+  if (!pidEnabled || targetPosition != clampedTarget) {
 
-    // Reinitialize PID if target changed
-    // or PID was previously disabled
-    if (!pidEnabled || targetPosition != clampedTarget) {
+    integralError = 0.0f;
 
-        integralError = 0.0f;
+    lastError = (float)(clampedTarget - getEncoderCount());
 
-        lastError =
-            (float)(
-                clampedTarget -
-                getEncoderCount()
-            );
+    lastTime = millis();
 
-        lastTime = millis();
+    lastMotionTime = millis();
 
-        lastMotionTime = millis();
+    lastEncoderCount = getEncoderCount();
 
-        lastEncoderCount = getEncoderCount();
+    pidEnabled = true;
+  }
 
-        pidEnabled = true;
-    }
-
-    targetPosition = clampedTarget;
+  targetPosition = clampedTarget;
 }
-
 
 // ============================================================
 // DISABLE PID
@@ -378,13 +203,12 @@ void enablePID(long newTarget) {
 
 void disablePID() {
 
-    pidEnabled = false;
+  pidEnabled = false;
 
-    integralError = 0.0f;
+  integralError = 0.0f;
 
-    ledcWrite(PIN_PWM, 0);
+  ledcWrite(PIN_PWM, 0);
 }
-
 
 // ============================================================
 // PID UPDATE
@@ -392,187 +216,131 @@ void disablePID() {
 
 void updatePID() {
 
-    // Skip if PID disabled or encoder fault
-    if (!pidEnabled || encoderFault) {
-        return;
-    }
+  // Skip if PID disabled or encoder fault
+  if (!pidEnabled || encoderFault) {
+    return;
+  }
 
+  unsigned long now = millis();
 
-    unsigned long now = millis();
+  // Calculate delta time
+  float dt = (now - lastTime) / 1000.0f;
 
+  // Minimum update interval = 5 ms
+  if (dt < 0.005f) {
+    return;
+  }
 
-    // Calculate delta time
-    float dt =
-        (now - lastTime) / 1000.0f;
+  lastTime = now;
 
+  // --------------------------------------------------------
+  // Read encoder
+  // --------------------------------------------------------
 
-    // Minimum update interval = 5 ms
-    if (dt < 0.005f) {
-        return;
-    }
+  long currentPos = getEncoderCount();
 
-    lastTime = now;
+  // Calculate position error
+  float error = (float)(targetPosition - currentPos);
 
+  // --------------------------------------------------------
+  // Deadband
+  // --------------------------------------------------------
 
-    // --------------------------------------------------------
-    // Read encoder
-    // --------------------------------------------------------
+  if (abs(error) <= deadband) {
 
-    long currentPos = getEncoderCount();
+    ledcWrite(PIN_PWM, 0);
 
+    lastMotionTime = now;
 
-    // Calculate position error
-    float error =
-        (float)(
-            targetPosition -
-            currentPos
-        );
+    lastEncoderCount = currentPos;
 
+    return;
+  }
 
-    // --------------------------------------------------------
-    // Deadband
-    // --------------------------------------------------------
+  // --------------------------------------------------------
+  // Encoder Safety Check
+  // --------------------------------------------------------
 
-    if (abs(error) <= deadband) {
+  if (abs(currentPos - lastEncoderCount) > 10) {
+    lastEncoderCount = currentPos;
+    lastMotionTime = now;
+  }
 
-        ledcWrite(PIN_PWM, 0);
+  else if (now - lastMotionTime > ENCODER_TIMEOUT_MS) {
 
-        lastMotionTime = now;
+    encoderFault = true;
 
-        lastEncoderCount = currentPos;
+    stopSteeringMotor();
 
-        return;
-    }
+    Serial.println("[SAFETY ALERT] Encoder not responding! "
+                   "Steering disabled.");
 
+    return;
+  }
 
-    // --------------------------------------------------------
-    // Encoder Safety Check
-    // --------------------------------------------------------
+  // --------------------------------------------------------
+  // Integral
+  // --------------------------------------------------------
 
-    if (currentPos != lastEncoderCount) {
+  integralError += error * dt;
 
-        lastEncoderCount = currentPos;
+  integralError = constrain(integralError, -maxIntegral, maxIntegral);
 
-        lastMotionTime = now;
+  // --------------------------------------------------------
+  // Derivative
+  // --------------------------------------------------------
 
-    }
-    else if (
-        now - lastMotionTime >
-        ENCODER_TIMEOUT_MS
-    ) {
+  float derivative = (error - lastError) / dt;
 
-        encoderFault = true;
+  lastError = error;
 
-        stopSteeringMotor();
+  // --------------------------------------------------------
+  // PID Output
+  // --------------------------------------------------------
 
-        Serial.println(
-            "[SAFETY ALERT] Encoder not responding! "
-            "Steering disabled."
-        );
+  float output = (Kp * error) + (Ki * integralError) + (Kd * derivative);
 
-        return;
-    }
+  // --------------------------------------------------------
+  // Direction
+  // --------------------------------------------------------
 
+  if (output > 0) {
 
-    // --------------------------------------------------------
-    // Integral
-    // --------------------------------------------------------
+    digitalWrite(PIN_DIR, DIR_RIGHT);
 
-    integralError += error * dt;
+  } else {
 
-    integralError =
-        constrain(
-            integralError,
-            -maxIntegral,
-            maxIntegral
-        );
+    digitalWrite(PIN_DIR, DIR_LEFT);
+  }
 
+  // --------------------------------------------------------
+  // PWM Magnitude
+  // --------------------------------------------------------
 
-    // --------------------------------------------------------
-    // Derivative
-    // --------------------------------------------------------
+  int pwmVal = (int)abs(output);
 
-    float derivative =
-        (error - lastError) / dt;
+  // Minimum PWM to overcome friction
+  if (pwmVal < minPWM) {
+    pwmVal = minPWM;
+  }
 
-    lastError = error;
+  // Maximum safe PWM
+  pwmVal = constrain(pwmVal, 0, maxPWM);
 
+  // --------------------------------------------------------
+  // Software Limit Safety
+  // --------------------------------------------------------
 
-    // --------------------------------------------------------
-    // PID Output
-    // --------------------------------------------------------
+  if ((currentPos >= MAX_POS_LIMIT && output > 0) ||
+      (currentPos <= MIN_POS_LIMIT && output < 0)) {
 
-    float output =
-        (Kp * error) +
-        (Ki * integralError) +
-        (Kd * derivative);
+    ledcWrite(PIN_PWM, 0);
 
+  } else {
 
-    // --------------------------------------------------------
-    // Direction
-    // --------------------------------------------------------
-
-    if (output > 0) {
-
-        digitalWrite(
-            PIN_DIR,
-            DIR_RIGHT
-        );
-
-    }
-    else {
-
-        digitalWrite(
-            PIN_DIR,
-            DIR_LEFT
-        );
-    }
-
-
-    // --------------------------------------------------------
-    // PWM Magnitude
-    // --------------------------------------------------------
-
-    int pwmVal =
-        (int)abs(output);
-
-
-    // Minimum PWM to overcome friction
-    if (pwmVal < minPWM) {
-        pwmVal = minPWM;
-    }
-
-
-    // Maximum safe PWM
-    pwmVal =
-        constrain(
-            pwmVal,
-            0,
-            maxPWM
-        );
-
-
-    // --------------------------------------------------------
-    // Software Limit Safety
-    // --------------------------------------------------------
-
-    if (
-        (currentPos >= MAX_POS_LIMIT && output > 0) ||
-        (currentPos <= MIN_POS_LIMIT && output < 0)
-    ) {
-
-        ledcWrite(PIN_PWM, 0);
-
-    }
-    else {
-
-        ledcWrite(
-            PIN_PWM,
-            pwmVal
-        );
-    }
+    ledcWrite(PIN_PWM, pwmVal);
+  }
 }
-
 
 // ============================================================
 // MANUAL LIMIT CHECK
@@ -580,50 +348,34 @@ void updatePID() {
 
 void checkManualLimits() {
 
-    // Don't interfere with PID
-    // or unrestricted calibration
-    if (
-        pidEnabled ||
-        manualUnrestricted
-    ) {
-        return;
-    }
+  // Don't interfere with PID
+  // or unrestricted calibration
+  if (pidEnabled || manualUnrestricted) {
+    return;
+  }
 
+  long currentPos = getEncoderCount();
 
-    long currentPos =
-        getEncoderCount();
+  int currentDir = digitalRead(PIN_DIR);
 
+  // --------------------------------------------------------
+  // Left limit
+  // --------------------------------------------------------
 
-    int currentDir =
-        digitalRead(PIN_DIR);
+  if (currentPos >= MAX_POS_LIMIT && currentDir == DIR_RIGHT) {
 
+    ledcWrite(PIN_PWM, 0);
+  }
 
-    // --------------------------------------------------------
-    // Left limit
-    // --------------------------------------------------------
+  // --------------------------------------------------------
+  // Right limit
+  // --------------------------------------------------------
 
-    if (
-        currentPos >= MAX_POS_LIMIT &&
-        currentDir == DIR_RIGHT
-    ) {
+  else if (currentPos <= MIN_POS_LIMIT && currentDir == DIR_LEFT) {
 
-        ledcWrite(PIN_PWM, 0);
-    }
-
-
-    // --------------------------------------------------------
-    // Right limit
-    // --------------------------------------------------------
-
-    else if (
-        currentPos <= MIN_POS_LIMIT &&
-        currentDir == DIR_LEFT
-    ) {
-
-        ledcWrite(PIN_PWM, 0);
-    }
+    ledcWrite(PIN_PWM, 0);
+  }
 }
-
 
 // ============================================================
 // JOG LEFT
@@ -631,51 +383,29 @@ void checkManualLimits() {
 
 void jogLeft(bool unrestricted) {
 
-    disablePID();
+  disablePID();
 
-    manualUnrestricted = unrestricted;
+  manualUnrestricted = unrestricted;
 
+  // Move if unrestricted OR not at left limit
+  if (unrestricted || getEncoderCount() > MIN_POS_LIMIT) {
 
-    // Move if unrestricted OR not at left limit
-    if (
-        unrestricted ||
-        getEncoderCount() > MIN_POS_LIMIT
-    ) {
+    digitalWrite(PIN_DIR, DIR_LEFT);
 
-        digitalWrite(
-            PIN_DIR,
-            DIR_LEFT
-        );
+    ledcWrite(PIN_PWM, minPWM + 30);
 
+    Serial.println(unrestricted ? "Calibration LEFT..."
+                                : "Manual LEFT (Limit Protected)...");
+  }
 
-        ledcWrite(
-            PIN_PWM,
-            minPWM + 30
-        );
+  else {
 
+    ledcWrite(PIN_PWM, 0);
 
-        Serial.println(
-            unrestricted
-                ? "Calibration LEFT..."
-                : "Manual LEFT (Limit Protected)..."
-        );
-    }
-
-    else {
-
-        ledcWrite(
-            PIN_PWM,
-            0
-        );
-
-
-        Serial.println(
-            "Manual LEFT blocked: "
-            "At/Past MIN limit"
-        );
-    }
+    Serial.println("Manual LEFT blocked: "
+                   "At/Past MIN limit");
+  }
 }
-
 
 // ============================================================
 // JOG RIGHT
@@ -683,51 +413,29 @@ void jogLeft(bool unrestricted) {
 
 void jogRight(bool unrestricted) {
 
-    disablePID();
+  disablePID();
 
-    manualUnrestricted = unrestricted;
+  manualUnrestricted = unrestricted;
 
+  // Move if unrestricted OR not at right limit
+  if (unrestricted || getEncoderCount() < MAX_POS_LIMIT) {
 
-    // Move if unrestricted OR not at right limit
-    if (
-        unrestricted ||
-        getEncoderCount() < MAX_POS_LIMIT
-    ) {
+    digitalWrite(PIN_DIR, DIR_RIGHT);
 
-        digitalWrite(
-            PIN_DIR,
-            DIR_RIGHT
-        );
+    ledcWrite(PIN_PWM, minPWM + 30);
 
+    Serial.println(unrestricted ? "Calibration RIGHT..."
+                                : "Manual RIGHT (Limit Protected)...");
+  }
 
-        ledcWrite(
-            PIN_PWM,
-            minPWM + 30
-        );
+  else {
 
+    ledcWrite(PIN_PWM, 0);
 
-        Serial.println(
-            unrestricted
-                ? "Calibration RIGHT..."
-                : "Manual RIGHT (Limit Protected)..."
-        );
-    }
-
-    else {
-
-        ledcWrite(
-            PIN_PWM,
-            0
-        );
-
-
-        Serial.println(
-            "Manual RIGHT blocked: "
-            "At/Past MAX limit"
-        );
-    }
+    Serial.println("Manual RIGHT blocked: "
+                   "At/Past MAX limit");
+  }
 }
-
 
 // ============================================================
 // STOP STEERING MOTOR
@@ -735,12 +443,13 @@ void jogRight(bool unrestricted) {
 
 void stopSteeringMotor() {
 
-    disablePID();
+  disablePID();
 
-    manualUnrestricted = false;
+  manualUnrestricted = false;
 
-    ledcWrite(
-        PIN_PWM,
-        0
-    );
+  ledcWrite(PIN_PWM, 0);
+}
+
+float getSteeringAngleDegrees() {
+  return (getEncoderCount() * 360.0f) / (float)TOTAL_ENC_COUNTS;
 }

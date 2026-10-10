@@ -1,6 +1,6 @@
 # Autonomous Go-Kart Controller System
 
-UPDATED : 12 September 2026
+UPDATED : 8 October 2026
 
 
 A robust, safety-critical drive-by-wire and ROS 2 control system for an Ackermann-steering electric go-kart / autonomous ground vehicle (AGV). 
@@ -56,7 +56,7 @@ This repository contains:
                            |  - Master Mode Selector (Channel 6)           |
                            |  - Universal RC Brake Override (Channel 5)    |
                            |  - Watchdog & Encoder Stall Detectors         |
-                           |  - Steering Position PID via PCNT Hardware    |
+                           |  - Steering Position PID via MT6835 SPI Bus   |
                            |  - DAC Voltage Generator for EV Throttle      |
                            |  - Timed H-Bridge Actuator for Braking        |
                            +-----------------------------------------------+
@@ -68,8 +68,8 @@ This repository contains:
 |       Steering Subsystem       | |       Throttle Subsystem       | |        Brake Subsystem         |
 |                                | |                                | |                                |
 | - BTS7960 Driver (PWM/DIR)     | | - ESP32 Internal DAC (Pin 25)  | | - BTS7960 H-Bridge (PWM L/R)   |
-| - Optical Quadrature Encoder   | | - Linear 0.8V - 3.3V Output    | | - Linear Brake Actuator        |
-|   read via ESP32 PCNT          | | - Electric Vehicle Motor       | | - Hardware Limit Switch        |
+| - MT6835 21-Bit Magnetic       | | - Linear 0.8V - 3.3V Output    | | - Linear Brake Actuator        |
+|   Absolute Encoder (SPI Mode 3)| | - Electric Vehicle Motor       | | - Hardware Limit Switch        |
 | - Closed-loop PID control      | |   Speed Controller (e.g. Kelly)| | - Timed Stroke Tracking        |
 +--------------------------------+ +--------------------------------+ +--------------------------------+
 ```
@@ -87,8 +87,10 @@ The system is hosted on an **ESP32 DevKit** board interfacing directly with the 
 | **GPIO 34** | UART2 RX (Input Only) | FS-iA6B iBUS Out | Receives 32-byte 14-channel serial RC frames at 115200 baud. |
 | **GPIO 26** | LEDC PWM Channel 0 | BTS7960 PWM | Steering motor PWM speed control (5 kHz frequency, 8-bit resolution). |
 | **GPIO 27** | Digital Output | BTS7960 DIR | Steering motor direction signal (`HIGH` = Decreases Count / Left, `LOW` = Right). |
-| **GPIO 14** | Pulse Counter (PCNT) | Optical Encoder Ch A | Steering feedback quadrature channel A. |
-| **GPIO 4**  | Pulse Counter (PCNT) | Optical Encoder Ch B | Steering feedback quadrature channel B. |
+| **GPIO 4**  | Digital Output | MT6835 CS | SPI Chip Select for MT6835 21-bit magnetic encoder. |
+| **GPIO 14** | SPI SCK | MT6835 SCK | SPI Serial Clock for MT6835 (HSPI native clock line, 1 MHz). |
+| **GPIO 35** | Digital Input (Input Only)| MT6835 MISO | SPI Master-In-Slave-Out data line from MT6835 to ESP32. |
+| **GPIO 23** | Digital Output | MT6835 MOSI | SPI Master-Out-Slave-In command line from ESP32 to MT6835. |
 | **GPIO 25** | DAC Output (8-bit) | EV Motor Controller | Analog throttle input: `0V` = Stop, `~0.8V` (`DAC 62`) = Idle, `~3.3V` (`DAC 255`) = Full Throttle. |
 | **GPIO 16** | LEDC PWM Channel 2 | BTS7960 RPWM | Brake actuator extend control (10 kHz PWM, applies brakes). |
 | **GPIO 17** | LEDC PWM Channel 3 | BTS7960 LPWM | Brake actuator retract control (10 kHz PWM, releases brakes). |
@@ -130,9 +132,10 @@ Safety is built in depth across both the host software and micro-controller firm
 3. **Autonomous Watchdog Timer**:
    - In Autonomous mode, the ESP32 expects valid 3-byte serial packets at least every 500 ms.
    - If the laptop script crashes, freezes, or disconnects, the watchdog immediately disables steering PID and sets throttle to zero.
-4. **Steering Encoder Stall & Disconnection Fault Detection**:
-   - If the steering motor is commanded with non-zero PWM but the encoder count fails to change within `ENCODER_TIMEOUT_MS = 100 ms`, the firmware raises an `encoderFault`.
-   - Throttle is immediately cut and steering PID is shut down to prevent motor burnout, mechanical stripping, or open-loop runaways.
+4. **Steering MT6835 Magnetic Encoder Stall & Disconnection Fault Detection**:
+   - If the steering motor is commanded with non-zero PWM but encoder count movement does not exceed the noise threshold (`> 10 counts`) within `ENCODER_TIMEOUT_MS = 100 ms`, the firmware raises an `encoderFault`.
+   - On every SPI read, if lines return floating high or all zeros, or if the MT6835 reports magnet loss, `encoderFault` is asserted.
+   - Throttle is immediately cut to 0V and the steering motor is powered off to prevent motor burnout, mechanical stripping, or open-loop runaways.
 5. **Throttle-Brake Interlock**:
    - Whenever brakes are engaged (`cmd.brake == 1` or `isBrakeApplied()`), the throttle is strictly locked to 0V / minimum DAC value.
 6. **Host Communication Failure Detection**:
@@ -151,7 +154,7 @@ The firmware receives packed 3-byte binary frames without variable headers to mi
 ```cpp
 #pragma pack(push, 1)
 struct KartCommand {
-    int8_t  steering;   // -100 to 100 (maps to encoder target -20000 to +20000)
+    int8_t  steering;   // -100 to 100 (maps to encoder target -349525 to +349525 / ±60 deg)
     uint8_t throttle;   // 0 to 100    (maps to DAC value 62 to 255)
     uint8_t brake;      // 0 (released) or 1 (engaged)
 };
@@ -160,22 +163,22 @@ static_assert(sizeof(KartCommand) == 3, "KartCommand must be exactly 3 bytes");
 ```
 
 - **Transmission Rate**: 20 Hz (every 50 ms).
-- **Steering**: `-100` (Full Left) to `+100` (Full Right).
+- **Steering**: `-100` (Full Left, $-60^\circ$) to `+100` (Full Right, $+60^\circ$).
 - **Throttle**: `0` (Idle, ~0.8V DAC) to `100` (Max speed, ~3.3V DAC).
 - **Brake**: `0` (Retract linear actuator) or `1` (Extend linear actuator).
 
 ### Calibration & Diagnostic ASCII Commands
 
 When a single ASCII byte is sent (e.g. via serial terminal):
-- `'C'`: Centers the steering (drives PID to position 0).
-- `'Z'`: Zeroes the encoder count, resets the estimated brake position, and clears encoder faults.
+- `'C'`: Centers the steering (drives PID to position 0 / dead center).
+- `'Z'`: Calibrates current physical steering position as Dead Center ($0^\circ$), resets estimated brake position, and clears encoder faults.
 - `'S'`: Emergency stop (kills all motors, brakes, and throttle).
 
 ### Uplink: ESP32 -> Host (Telemetry Stream)
 
 The ESP32 broadcasts human-readable telemetry at 10 Hz:
 ```
-RC Mode: <RC|AUTONOMOUS> | FS: <RC ON|RC OFF> | Enc Fault: <YES|NO> | CH1 Steer: <pwm> | CH3 Thr: <pwm> | Steer Pos: <ticks> | Target: <ticks> | Brake: <ENGAGED|RELEASED> (<ms>) | BRAKE_VALUE: <ch5>
+RC Mode: <RC|AUTONOMOUS> | FS: <RC ON|RC OFF> | Enc Fault: <YES|NO> | Steer: <deg> deg (<ticks> ticks) | Target: <ticks> | Brake: <ENGAGED|RELEASED>
 ```
 
 The ROS 2 node continuously parses this telemetry to populate diagnostics and warn operators if `/cmd_vel` is being discarded due to RC mode or failsafe.
@@ -194,8 +197,8 @@ The ROS 2 node continuously parses this telemetry to populate diagnostics and wa
 │   ├── ibus_config.h                    # iBUS UART and channel threshold configuration
 │   ├── ibus_receiver.h                  # iBUS protocol parser class declaration
 │   ├── ibus_receiver.cpp                # Non-blocking iBUS frame decoder & checksum validator
-│   ├── steering.h                       # Steering PID & PCNT hardware driver headers
-│   ├── steering.cpp                     # Pulse counter quadrature decoding, PID loop, fault detection
+│   ├── steering.h                       # Steering PID & MT6835 SPI hardware driver headers
+│   ├── steering.cpp                     # MT6835 21-bit angle decoding, circular wrap math, PID loop, fault detection
 │   ├── throttle.h                       # DAC pin definitions and voltage thresholds
 │   ├── throttle.cpp                     # Safe DAC throttle scaling and zeroing logic
 │   ├── brake.h                          # BTS7960 brake actuator driver header
@@ -227,13 +230,19 @@ The ROS 2 node continuously parses this telemetry to populate diagnostics and wa
 Located in `esp32_code/`, the firmware is built using the Arduino-ESP32 framework.
 
 ### Steering Subsystem (`steering.cpp` / `steering.h`)
-- **Hardware Quadrature Decoding**: Leverages ESP32 hardware Pulse Counter (PCNT) peripheral (`driver/pulse_cnt.h`) across GPIO 14 and GPIO 4 to track optical encoder counts without wasting CPU cycles on GPIO interrupts.
+- **MT6835 21-Bit Magnetic Absolute Encoder**:
+  - Interfaced via hardware SPI (Mode 3, 1 MHz) on **GPIO 4 (CS)**, **GPIO 14 (SCK)**, **GPIO 35 (MISO)**, and **GPIO 23 (MOSI)**.
+  - Generates $2^{21} = 2,097,152$ counts per $360^\circ$ revolution ($\approx 5,825.4$ counts per degree).
+  - Implements $180^\circ$ circular wrap-around modular arithmetic across the zero-boundary.
+  - Does not require a homing routine on power-up; reports true absolute physical orientation immediately on boot.
 - **Closed-Loop PID Control**:
-  - Proportional Gain: $K_p = 0.20$
-  - Integral Gain: $K_i = 0.001$ (clamped with anti-windup to $\pm 1000$)
-  - Derivative Gain: $K_d = 0.02$
-  - Output deadband of 10 counts and static friction compensation (`minPWM = 25`, `maxPWM = 150`).
-- **Encoder Stall Detection**: If commanded motor PWM is active but no encoder ticks occur for $> 100\text{ ms}$, the system trips an encoder fault, cuts throttle, and disables the PID loop.
+  - Proportional Gain: $K_p = 0.012$
+  - Integral Gain: $K_i = 0.00005$ (clamped with anti-windup to $\pm 10000$)
+  - Derivative Gain: $K_d = 0.0015$
+  - Output deadband of 150 counts ($\approx 0.025^\circ$) and static friction compensation (`minPWM = 25`, `maxPWM = 150`).
+  - Software travel limits: $\pm 60.0^\circ$ (`MAX_POS_LIMIT = +349525`, `MIN_POS_LIMIT = -349525`).
+- **Encoder Health & Stall Detection**:
+  - If commanded motor PWM is active but encoder count does not move past the noise threshold ($> 10\text{ counts}$) for $> 100\text{ ms}$, the system trips `encoderFault`, cuts throttle to 0V, powers off the steering motor, and prints an alert.
 
 ### Throttle Subsystem (`throttle.cpp` / `throttle.h`)
 - Uses ESP32 internal 8-bit DAC on **GPIO 25**.
