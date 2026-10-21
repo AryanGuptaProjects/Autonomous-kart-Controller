@@ -8,7 +8,21 @@
 static uint32_t deadCenterCount = DEFAULT_DEAD_CENTER;
 
 // Direction convention: 1 = Normal, -1 = Inverted
-constexpr int ANGLE_ROTATION_DIRECTION = 1;
+static int angleRotationDirection = 1;
+
+void invertSteeringDirection() {
+  angleRotationDirection = -angleRotationDirection;
+  resetEncoderFilter();
+}
+
+int getSteeringDirection() {
+  return angleRotationDirection;
+}
+
+void setSteeringDirection(int dir) {
+  angleRotationDirection = (dir < 0) ? -1 : 1;
+  resetEncoderFilter();
+}
 
 // Maps physical pin states to logical left/right steering directions
 constexpr int DIR_THAT_DECREASES_COUNT = HIGH;
@@ -28,19 +42,19 @@ constexpr int pwmResolution = 8; // 8-bit resolution (0-255)
 int minPWM = 25;  // Minimum PWM to overcome mechanical static friction
 int maxPWM = 150; // Maximum safe PWM cap
 int deadband =
-    150; // Acceptable count error (~150 counts is only 0.025 degrees!)
+    4000; // Acceptable count error (~1800 counts is ~0.30 deg, eliminates backlash hunting/jitter!)
 
 // ============================================================
-// PID Tuning Parameters (Scaled down for 21-bit MT6835)
+// PID Tuning Parameters (Scaled for 21-bit MT6835 with 1:28 gearbox)
 // ============================================================
-float Kp = 0.012f;   // Down from 0.20 (scaled down ~16x for 21-bit counts)
-float Ki = 0.00005f; // Down from 0.001
-float Kd = 0.0015f;  // Down from 0.02
+float Kp = 0.012f; // Proportional response
+float Ki = 0.0f;   // Set to 0 to ELIMINATE slow integral windup creep!
+float Kd = 0.0018f; // Damping to prevent overshoot and stop jitter
 
 // ============================================================
 // Integral Limits
 // ============================================================
-float maxIntegral = 10000.0f; // Adjusted for larger count error accumulation
+float maxIntegral = 0.0f; // Not needed with Ki = 0
 
 // ============================================================
 // State Variables
@@ -54,6 +68,8 @@ bool manualUnrestricted = false;
 // Internal PID States
 // ============================================================
 
+static float lastPosF = 0.0f;
+static float currentPwm = 0.0f;
 static float lastError = 0.0f;
 static float integralError = 0.0f;
 static unsigned long lastTime = 0;
@@ -76,7 +92,9 @@ constexpr unsigned long ENCODER_TIMEOUT_MS = 100;
 
 void setupSteering() {
   pinMode(PIN_DIR, OUTPUT);
+  digitalWrite(PIN_DIR, LOW);
   ledcAttach(PIN_PWM, pwmFreq, pwmResolution);
+  ledcWrite(PIN_PWM, 0); // Immediately guarantee motor power is 0 on boot!
 
   // Initialize Chip Select
   pinMode(PIN_ENC_CS, OUTPUT);
@@ -85,6 +103,9 @@ void setupSteering() {
   // Start SPI bus with custom pin mapping
   // SPI.begin(SCK, MISO, MOSI, CS)
   SPI.begin(PIN_ENC_SCK, PIN_ENC_MISO, PIN_ENC_MOSI, PIN_ENC_CS);
+
+  // Prime first read
+  readRawEncoderAngle();
 }
 
 // ============================================================
@@ -92,10 +113,10 @@ void setupSteering() {
 // ============================================================
 
 // ============================================================
-// GET ENCODER COUNT
+// GET RAW ENCODER COUNT
 // ============================================================
 
-long getEncoderCount() {
+long getRawEncoderCount() {
   uint32_t raw = readRawEncoderAngle();
   int32_t diff = (int32_t)raw - (int32_t)deadCenterCount;
 
@@ -106,18 +127,72 @@ long getEncoderCount() {
     diff += TOTAL_ENC_COUNTS;
   }
 
-  return (long)(diff * ANGLE_ROTATION_DIRECTION);
+  return (long)(diff * angleRotationDirection);
 }
 
 // ============================================================
-// MT6835 SPI Read Protocol
+// LOW-PASS FILTER STATE & FUNCTIONS
 // ============================================================
+
+float encoderLpfAlpha = DEFAULT_ENCODER_LPF_ALPHA;
+static float filteredEncoderCount = 0.0f;
+static bool filterInitialized = false;
+static unsigned long lastEncoderReadMicros = 0;
+
+void setEncoderFilterAlpha(float alpha) {
+  encoderLpfAlpha = constrain(alpha, 0.01f, 1.0f);
+}
+
+float getEncoderFilterAlpha() {
+  return encoderLpfAlpha;
+}
+
+void resetEncoderFilter() {
+  filterInitialized = false;
+  lastEncoderReadMicros = 0;
+}
+
+float getFilteredEncoderCount() {
+  getEncoderCount(); // Ensure the filter holds the most recent sample
+  return filteredEncoderCount;
+}
+
+// ============================================================
+// GET FILTERED ENCODER COUNT
+// ============================================================
+
+long getEncoderCount() {
+  unsigned long nowMicros = micros();
+
+  // Rate-limit SPI reads and filter steps to at most once per 1000us (1ms / 1kHz).
+  // This prevents back-to-back calls in the same loop cycle from applying duplicate
+  // filter advances or overloading the SPI bus.
+  if (!filterInitialized || (nowMicros - lastEncoderReadMicros >= 1000)) {
+    lastEncoderReadMicros = nowMicros;
+    long raw = getRawEncoderCount();
+
+    if (!filterInitialized) {
+      filteredEncoderCount = (float)raw;
+      filterInitialized = true;
+    } else {
+      // 1st-Order Exponential Moving Average (EMA) Low-Pass Filter:
+      // y[k] = y[k-1] + alpha * (x[k] - y[k-1])
+      filteredEncoderCount += encoderLpfAlpha * ((float)raw - filteredEncoderCount);
+    }
+  }
+
+  return (long)roundf(filteredEncoderCount);
+}
+
+static bool magnetDetected = false;
+static uint8_t lastRawStatus = 0;
+static uint8_t lastRawB0 = 0, lastRawB1 = 0, lastRawB2 = 0;
 
 uint32_t readRawEncoderAngle() {
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
   digitalWrite(PIN_ENC_CS, LOW);
 
-  // Command to read angle register 0x003
+  // Command to read starting at angle register 0x003
   SPI.transfer(0xA0);
   SPI.transfer(0x03);
 
@@ -128,7 +203,33 @@ uint32_t readRawEncoderAngle() {
   digitalWrite(PIN_ENC_CS, HIGH);
   SPI.endTransaction();
 
+  lastRawB0 = b0;
+  lastRawB1 = b1;
+  lastRawB2 = b2;
+
+  // Status bits are in bits 2..0 of b2
+  lastRawStatus = b2 & 0x07;
+  bool allZero = (b0 == 0 && b1 == 0 && b2 == 0);
+  bool allFF   = (b0 == 0xFF && b1 == 0xFF && b2 == 0xFF);
+
+  // Valid as long as SPI wires are active and delivering real data
+  magnetDetected = !allZero && !allFF;
+
   return ((uint32_t)b0 << 13) | ((uint32_t)b1 << 5) | (b2 >> 3);
+}
+
+bool isMagnetValid() {
+  return magnetDetected;
+}
+
+uint8_t getMagnetStatusBits() {
+  return lastRawStatus;
+}
+
+void getRawSpiBytes(uint8_t &b0, uint8_t &b1, uint8_t &b2) {
+  b0 = lastRawB0;
+  b1 = lastRawB1;
+  b2 = lastRawB2;
 }
 
 // ============================================================
@@ -138,8 +239,27 @@ uint32_t readRawEncoderAngle() {
 void zeroEncoderCount() {
   // Save the current physical position as the straight-ahead reference
   deadCenterCount = readRawEncoderAngle();
+  resetEncoderFilter();
   clearEncoderFault();
-  Serial.printf("[ENCODER] Calibrated new Dead Center: %u\n", deadCenterCount);
+  float rawDeg = (deadCenterCount * 360.0f) / (float)TOTAL_ENC_COUNTS;
+  Serial.printf("\n>>> [ENCODER] Calibrated new Dead Center: %u (%.2f deg)\n", deadCenterCount, rawDeg);
+  Serial.printf(">>> Set 'DEFAULT_DEAD_CENTER = %u;' in steering.h to make permanent.\n\n", deadCenterCount);
+}
+
+// ============================================================
+// MAGNET TELEMETRY HELPERS
+// ============================================================
+
+uint32_t getRawMagnetCount() {
+  return readRawEncoderAngle();
+}
+
+float getRawMagnetDegrees() {
+  return (readRawEncoderAngle() * 360.0f) / (float)TOTAL_ENC_COUNTS;
+}
+
+uint32_t getDeadCenterCount() {
+  return deadCenterCount;
 }
 
 // ============================================================
@@ -166,7 +286,6 @@ void clearEncoderFault() {
 // ============================================================
 
 void enablePID(long newTarget) {
-
   // Do not engage PID if encoder has a fault
   if (encoderFault) {
     return;
@@ -177,20 +296,16 @@ void enablePID(long newTarget) {
   // Clamp target to safe mechanical boundaries
   long clampedTarget = constrain(newTarget, MIN_POS_LIMIT, MAX_POS_LIMIT);
 
-  // Reinitialize PID if target changed
-  // or PID was previously disabled
-  if (!pidEnabled || targetPosition != clampedTarget) {
-
+  // Initialize PID state ONLY if PID was previously disabled.
+  // Note: We do NOT wipe integralError or reset timers when targetPosition moves,
+  // allowing smooth continuous tracking during active steering!
+  if (!pidEnabled) {
     integralError = 0.0f;
-
-    lastError = (float)(clampedTarget - getEncoderCount());
-
+    lastPosF = getFilteredEncoderCount();
     lastTime = millis();
-
     lastMotionTime = millis();
-
     lastEncoderCount = getEncoderCount();
-
+    currentPwm = 0.0f;
     pidEnabled = true;
   }
 
@@ -202,11 +317,9 @@ void enablePID(long newTarget) {
 // ============================================================
 
 void disablePID() {
-
   pidEnabled = false;
-
   integralError = 0.0f;
-
+  currentPwm = 0.0f;
   ledcWrite(PIN_PWM, 0);
 }
 
@@ -215,9 +328,15 @@ void disablePID() {
 // ============================================================
 
 void updatePID() {
-
   // Skip if PID disabled or encoder fault
   if (!pidEnabled || encoderFault) {
+    return;
+  }
+
+  // Safety cutoff: If magnet is missing or SPI is disconnected, kill motor immediately!
+  if (!magnetDetected) {
+    ledcWrite(PIN_PWM, 0);
+    currentPwm = 0.0f;
     return;
   }
 
@@ -226,7 +345,7 @@ void updatePID() {
   // Calculate delta time
   float dt = (now - lastTime) / 1000.0f;
 
-  // Minimum update interval = 5 ms
+  // Minimum update interval = 5 ms (up to 200 Hz update rate)
   if (dt < 0.005f) {
     return;
   }
@@ -234,112 +353,129 @@ void updatePID() {
   lastTime = now;
 
   // --------------------------------------------------------
-  // Read encoder
+  // Read filtered encoder position
   // --------------------------------------------------------
-
-  long currentPos = getEncoderCount();
+  float currentPosF = getFilteredEncoderCount();
+  long currentPos = (long)roundf(currentPosF);
 
   // Calculate position error
-  float error = (float)(targetPosition - currentPos);
+  float error = (float)(targetPosition - currentPosF);
+  float absError = abs(error);
 
   // --------------------------------------------------------
-  // Deadband
+  // Soft Deadband Check
   // --------------------------------------------------------
-
-  if (abs(error) <= deadband) {
-
+  if (absError <= (float)deadband) {
     ledcWrite(PIN_PWM, 0);
-
+    currentPwm = 0.0f;
     lastMotionTime = now;
-
     lastEncoderCount = currentPos;
-
+    lastPosF = currentPosF;
     return;
   }
 
   // --------------------------------------------------------
   // Encoder Safety Check
   // --------------------------------------------------------
-
   if (abs(currentPos - lastEncoderCount) > 10) {
     lastEncoderCount = currentPos;
     lastMotionTime = now;
-  }
-
-  else if (now - lastMotionTime > ENCODER_TIMEOUT_MS) {
-
+  } else if (now - lastMotionTime > ENCODER_TIMEOUT_MS) {
     encoderFault = true;
-
     stopSteeringMotor();
-
     Serial.println("[SAFETY ALERT] Encoder not responding! "
                    "Steering disabled.");
-
     return;
   }
 
   // --------------------------------------------------------
-  // Integral
+  // Integral with anti-windup
   // --------------------------------------------------------
-
   integralError += error * dt;
-
   integralError = constrain(integralError, -maxIntegral, maxIntegral);
 
   // --------------------------------------------------------
-  // Derivative
+  // Derivative on Measurement (Prevents derivative kick on setpoint moves)
   // --------------------------------------------------------
-
-  float derivative = (error - lastError) / dt;
-
-  lastError = error;
+  float dPos = (currentPosF - lastPosF) / dt;
+  lastPosF = currentPosF;
+  float derivative = -dPos; // Damping opposing motion
 
   // --------------------------------------------------------
   // PID Output
   // --------------------------------------------------------
-
   float output = (Kp * error) + (Ki * integralError) + (Kd * derivative);
 
   // --------------------------------------------------------
-  // Direction
+  // Direction with anti-backlash transition
   // --------------------------------------------------------
+  int desiredDir = (output > 0) ? DIR_RIGHT : DIR_LEFT;
+  static int activeDir = DIR_RIGHT;
+  if (activeDir != desiredDir) {
+    // Briefly drop PWM to 0 on direction change to protect gearbox and motor driver
+    ledcWrite(PIN_PWM, 0);
+    currentPwm = 0.0f;
+    digitalWrite(PIN_DIR, desiredDir);
+    activeDir = desiredDir;
+  }
 
-  if (output > 0) {
-
-    digitalWrite(PIN_DIR, DIR_RIGHT);
-
+  // --------------------------------------------------------
+  // Smooth Friction Compensation (Transition Band)
+  // --------------------------------------------------------
+  // Linearly ramps from 0 to minPWM over TRANSITION_BAND counts
+  // Eliminates hard 0 -> 25 PWM step cliff when exiting deadband
+  constexpr float TRANSITION_BAND = 1000.0f;
+  float frictionBoost = 0.0f;
+  if (absError < ((float)deadband + TRANSITION_BAND)) {
+    frictionBoost = (float)minPWM * ((absError - (float)deadband) / TRANSITION_BAND);
   } else {
-
-    digitalWrite(PIN_DIR, DIR_LEFT);
+    frictionBoost = (float)minPWM;
   }
 
   // --------------------------------------------------------
-  // PWM Magnitude
+  // Desired PWM with Slew-Rate Limiter (Prevents current/torque shocks)
   // --------------------------------------------------------
+  float desiredPwm = abs(output) + frictionBoost;
+  desiredPwm = constrain(desiredPwm, 0.0f, (float)maxPWM);
 
-  int pwmVal = (int)abs(output);
-
-  // Minimum PWM to overcome friction
-  if (pwmVal < minPWM) {
-    pwmVal = minPWM;
+  // Maximum slew rate: 600 PWM units/sec (~250ms for full 0 to 150 ramp)
+  float maxPwmStep = 600.0f * dt;
+  if (desiredPwm > currentPwm + maxPwmStep) {
+    currentPwm += maxPwmStep;
+  } else if (desiredPwm < currentPwm - maxPwmStep) {
+    currentPwm -= maxPwmStep;
+  } else {
+    currentPwm = desiredPwm;
   }
 
-  // Maximum safe PWM
-  pwmVal = constrain(pwmVal, 0, maxPWM);
+  int finalPwm = (int)roundf(currentPwm);
 
   // --------------------------------------------------------
   // Software Limit Safety
   // --------------------------------------------------------
-
   if ((currentPos >= MAX_POS_LIMIT && output > 0) ||
       (currentPos <= MIN_POS_LIMIT && output < 0)) {
-
     ledcWrite(PIN_PWM, 0);
-
-  } else {
-
-    ledcWrite(PIN_PWM, pwmVal);
+    currentPwm = 0.0f;
+    return;
   }
+
+  // --------------------------------------------------------
+  // Hard Runaway Protection
+  // If position exceeds +/-75 degrees, immediately trip safety cutoff
+  // to protect the linkage and prevent endless rotation.
+  // --------------------------------------------------------
+  constexpr long HARD_STOP_LIMIT = degToCounts(75.0f);
+  if (abs(currentPos) > HARD_STOP_LIMIT) {
+    encoderFault = true;
+    stopSteeringMotor();
+    Serial.println("\n[SAFETY ALERT] Steering runaway detected (exceeded +/-75 deg)! Motor STOPPED.");
+    Serial.println(">>> Motor was likely driving in the wrong direction (Positive Feedback).");
+    Serial.println(">>> Press 'I' to invert steering direction, then 'C' to re-center or 'Z' to re-calibrate.\n");
+    return;
+  }
+
+  ledcWrite(PIN_PWM, finalPwm);
 }
 
 // ============================================================
@@ -451,5 +587,5 @@ void stopSteeringMotor() {
 }
 
 float getSteeringAngleDegrees() {
-  return (getEncoderCount() * 360.0f) / (float)TOTAL_ENC_COUNTS;
+  return (getFilteredEncoderCount() * 360.0f) / (float)TOTAL_ENC_COUNTS;
 }

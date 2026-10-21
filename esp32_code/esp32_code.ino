@@ -31,12 +31,17 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  // 1. Immediately setup steering and force PWM to 0 so motor NEVER runs on boot!
+  setupSteering();
+  stopSteeringMotor();
+
+  // 2. Initialize brake and retract
   setupBrake();
   triggerBrakeRetract(BRAKE_MANUAL_SPEED);
   delay(2000);
 
+  // 3. Initialize RC and Throttle
   ibus.begin();
-  setupSteering();
   setupThrottle();
 
   printMenu();
@@ -106,17 +111,27 @@ void loop() {
   } else if (rcControlMode) {
     //--- Steering (Channel 1) ---
     float rawSteerNorm = ibus.channelNormalised(1);
-    if (abs(rawSteerNorm) < 0.03f)
+    // Center deadband: handles transmitter center drift/trim (e.g. 1508us resting value)
+    if (abs(rawSteerNorm) < 0.05f) {
       rawSteerNorm = 0.0f;
+    }
 
     static float filteredSteerNorm = 0.0f;
-    const float alpha = 0.15f;
-    filteredSteerNorm =
-        filteredSteerNorm + alpha * (rawSteerNorm - filteredSteerNorm);
+    const float alpha = 0.20f;
+    // When joystick is released (in deadband), decay cleanly and snap to exactly 0 (dead center)
+    if (rawSteerNorm == 0.0f && abs(filteredSteerNorm) < 0.015f) {
+      filteredSteerNorm = 0.0f;
+    } else {
+      filteredSteerNorm += alpha * (rawSteerNorm - filteredSteerNorm);
+      if (abs(filteredSteerNorm) < 0.002f) {
+        filteredSteerNorm = 0.0f;
+      }
+    }
 
-    long targetPos =
-        (long)(filteredSteerNorm *
-               (filteredSteerNorm >= 0 ? MAX_POS_LIMIT : abs(MIN_POS_LIMIT)));
+    long targetPos = (filteredSteerNorm == 0.0f)
+        ? 0
+        : (long)(filteredSteerNorm *
+                 (filteredSteerNorm >= 0 ? MAX_POS_LIMIT : abs(MIN_POS_LIMIT)));
 
     // Drive PID to live RC target position
     enablePID(targetPos);
@@ -146,16 +161,39 @@ void loop() {
   if (millis() - lastPrint > 100) {
     lastPrint = millis();
 
-    // Convert ticks to degrees for telemetry display
-    float steerDegrees = (getEncoderCount() * 360.0f) / (float)TOTAL_ENC_COUNTS;
+    uint32_t rawMagCount = getRawMagnetCount();
+    float rawMagDeg = getRawMagnetDegrees();
+    float steerDegrees = getSteeringAngleDegrees();
+    bool magOk = isMagnetValid();
+    uint8_t b0, b1, b2;
+    getRawSpiBytes(b0, b1, b2);
 
-    Serial.printf("RC Mode: %s | FS: %s | Enc Fault: %s | Steer: %.2f deg (%ld "
-                  "ticks) | Target: %ld | Brake: %s\n",
+    char magBuf[32];
+    if (magOk) {
+      snprintf(magBuf, sizeof(magBuf), "OK");
+    } else if (b0 == 0 && b1 == 0 && b2 == 0) {
+      snprintf(magBuf, sizeof(magBuf), "NO_MISO(0x00)");
+    } else if (b0 == 0xFF && b1 == 0xFF && b2 == 0xFF) {
+      snprintf(magBuf, sizeof(magBuf), "NO_SPI(0xFF)");
+    } else {
+      snprintf(magBuf, sizeof(magBuf), "ERR[%02X,%02X,%02X]", b0, b1, b2);
+    }
+
+    Serial.printf("RC Mode: %s | FS: %s | Enc Fault: %s | Mag: %s | CH1 Steer: %04d | CH3 Thr: %04d | Steer Pos: %ld (%.2f deg) | Raw Mag: %u (%.2f deg) | Center: %u | Brake: %s (%lums) | BRAKE_VALUE: %d\n",
                   rcControlMode ? "RC" : "AUTONOMOUS",
                   ibus.isFailsafe() ? "RC OFF" : "RC ON",
-                  isEncoderFault() ? "YES" : "NO", steerDegrees,
-                  getEncoderCount(), targetPosition,
-                  isBrakeApplied() ? "ENGAGED" : "RELEASED");
+                  isEncoderFault() ? "YES" : "NO",
+                  magBuf,
+                  ibus.channel(1),
+                  ibus.channel(3),
+                  getEncoderCount(),
+                  steerDegrees,
+                  rawMagCount,
+                  rawMagDeg,
+                  getDeadCenterCount(),
+                  isBrakeApplied() ? "ENGAGED" : "RELEASED",
+                  getBrakePositionMs(),
+                  ibus.channel(5));
   }
 }
 
@@ -212,6 +250,36 @@ void processSerialCommands() {
     cmd = toupper(cmd);
 
     switch (cmd) {
+    case 'M': {
+      uint8_t b0, b1, b2;
+      getRawSpiBytes(b0, b1, b2);
+      Serial.printf("\n==================================================\n");
+      Serial.printf("   MT6835 ENCODER & STEERING DIAGNOSTIC REPORT\n");
+      Serial.printf("==================================================\n");
+      Serial.printf(">>> Raw SPI Bytes: [0x%02X, 0x%02X, 0x%02X] (Status bits: 0x%02X)\n", b0, b1, b2, getMagnetStatusBits());
+      Serial.printf(">>> Magnet Signal: %s\n", isMagnetValid() ? "VALID (Magnet detected properly)" : "FAULT (Magnet missing, too far, or SPI wires disconnected!)");
+      Serial.printf(">>> Raw Magnet Count: %u\n", getRawMagnetCount());
+      Serial.printf(">>> Raw Magnet Angle: %.2f deg\n", getRawMagnetDegrees());
+      Serial.printf(">>> Active Dead Center: %u\n", getDeadCenterCount());
+      Serial.printf(">>> Steering Position: %ld counts (%.2f deg)\n", getEncoderCount(), getSteeringAngleDegrees());
+      Serial.printf(">>> Commanded Target:  %ld counts\n", targetPosition);
+      Serial.printf(">>> Steering Multiplier: %d (%s)\n", getSteeringDirection(), getSteeringDirection() == 1 ? "NORMAL" : "INVERTED");
+      Serial.printf("--------------------------------------------------\n");
+      Serial.printf(">>> To permanently store this straight-ahead position:\n");
+      Serial.printf("    Update 'DEFAULT_DEAD_CENTER = %u;' in steering.h\n", getRawMagnetCount());
+      Serial.printf("==================================================\n\n");
+      break;
+    }
+
+    case 'I':
+      invertSteeringDirection();
+      clearEncoderFault();
+      Serial.printf("\n>>> [CMD] Steering Direction Inverted! Multiplier: %d (%s)\n",
+                    getSteeringDirection(),
+                    getSteeringDirection() == 1 ? "NORMAL" : "INVERTED");
+      Serial.println(">>> Press 'C' to test centering with the new direction.\n");
+      break;
+
     case 'C':
       clearEncoderFault();
       enablePID(0); // Targets 0 counts (which is exact dead center!)
@@ -255,9 +323,11 @@ void printMenu() {
   Serial.println("--- Operating Mode ---");
   Serial.println("  Toggle Channel 6 on RC Remote to switch modes");
   Serial.println("  (Laptop control via 3-byte binary struct)");
-  Serial.println("--- System Calibration Controls (Keyboard) ---");
+  Serial.println("--- System Calibration & Safety Controls (Keyboard) ---");
+  Serial.println("  M     : Inspect Magnet Raw Angle & Dead Center Info");
+  Serial.println("  Z     : SET Current Position as Dead Center (0 deg)");
+  Serial.println("  I     : INVERT Steering Direction (Fix Runaway / Opposite Rotation)");
   Serial.println("  C     : Center Steering (PID Drive to Position 0)");
-  Serial.println("  Z     : ZERO Encoder Count & Clear Fault");
   Serial.println("  S     : STOP All Motors & Throttle");
   Serial.println("==================================================\n");
 }

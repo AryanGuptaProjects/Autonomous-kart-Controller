@@ -17,7 +17,7 @@ constexpr int PIN_ENC_MOSI = 23;
 // --- MT6835 21-Bit Resolution Constants ---
 constexpr uint32_t TOTAL_ENC_COUNTS = 2097152;          // 2^21 counts per 360 deg
 constexpr int32_t  HALF_ENC_COUNTS  = TOTAL_ENC_COUNTS / 2; // 1,048,576
-constexpr uint32_t DEFAULT_DEAD_CENTER = 2018873;      // Calibrated straight-ahead point
+constexpr uint32_t DEFAULT_DEAD_CENTER = 1823624;      // Calibrated straight-ahead point
 constexpr int32_t degToCounts(float deg) {
     return (int32_t)((deg * (float)TOTAL_ENC_COUNTS) / 360.0f);
 }
@@ -34,10 +34,29 @@ extern bool manualUnrestricted;
 void setupSteering();
 uint32_t readRawEncoderAngle();
 float getSteeringAngleDegrees();
+uint32_t getRawMagnetCount();
+float getRawMagnetDegrees();
+uint32_t getDeadCenterCount();
+void invertSteeringDirection();
+int getSteeringDirection();
+void setSteeringDirection(int dir);
+bool isMagnetValid();
+uint8_t getMagnetStatusBits();
+void getRawSpiBytes(uint8_t &b0, uint8_t &b1, uint8_t &b2);
 
+
+// --- Low-Pass Filter Configuration ---
+constexpr float DEFAULT_ENCODER_LPF_ALPHA = 0.15f; // Filter smoothing factor (0.01 = heavy smoothing, 1.0 = raw)
+extern float encoderLpfAlpha;
+
+void setEncoderFilterAlpha(float alpha);
+float getEncoderFilterAlpha();
+void resetEncoderFilter();
+float getFilteredEncoderCount();
 
 // --- Encoder Functions ---
 long getEncoderCount();
+long getRawEncoderCount();
 void zeroEncoderCount();
 
 // --- PID Controller Functions ---
