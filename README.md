@@ -1,6 +1,6 @@
 # Autonomous Go-Kart Controller System
 
-UPDATED : 10 October 2026
+UPDATED : 22 October 2026
 
 
 A robust, safety-critical drive-by-wire and ROS 2 control system for an Ackermann-steering electric go-kart / autonomous ground vehicle (AGV). 

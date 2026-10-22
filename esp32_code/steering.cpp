@@ -42,7 +42,7 @@ constexpr int pwmResolution = 8; // 8-bit resolution (0-255)
 int minPWM = 25;  // Minimum PWM to overcome mechanical static friction
 int maxPWM = 150; // Maximum safe PWM cap
 int deadband =
-    4000; // Acceptable count error (~1800 counts is ~0.30 deg, eliminates backlash hunting/jitter!)
+    18200; // Acceptable count error (~1800 counts is ~0.30 deg, eliminates backlash hunting/jitter!)
 
 // ============================================================
 // PID Tuning Parameters (Scaled for 21-bit MT6835 with 1:28 gearbox)
@@ -107,10 +107,6 @@ void setupSteering() {
   // Prime first read
   readRawEncoderAngle();
 }
-
-// ============================================================
-// SETUP NEW PCNT DRIVER
-// ============================================================
 
 // ============================================================
 // GET RAW ENCODER COUNT
