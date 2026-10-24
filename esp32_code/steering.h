@@ -18,6 +18,12 @@ constexpr int PIN_ENC_MOSI = 23;
 constexpr uint32_t TOTAL_ENC_COUNTS = 2097152;          // 2^21 counts per 360 deg
 constexpr int32_t  HALF_ENC_COUNTS  = TOTAL_ENC_COUNTS / 2; // 1,048,576
 constexpr uint32_t DEFAULT_DEAD_CENTER = 1823624;      // Calibrated straight-ahead point
+
+// --- Steering Gear Ratio Scaling ---
+// The magnetic sensor is mounted on a 1:28 reduced shaft (rotates 1/28th as much as steering angle).
+// Scaling raw magnet counts by 28 restores 1:1 true physical steering angle and tick counts.
+constexpr float STEERING_GEAR_RATIO = 28.0f;
+
 constexpr int32_t degToCounts(float deg) {
     return (int32_t)((deg * (float)TOTAL_ENC_COUNTS) / 360.0f);
 }
